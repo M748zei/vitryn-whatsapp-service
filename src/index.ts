@@ -1,5 +1,5 @@
 import express from "express";
-import { initSession, getStatus, sendMessage, disconnectSession } from "./sessions";
+import { initSession, getStatus, sendMessage, disconnectSession, gracefulShutdown } from "./sessions";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -65,6 +65,7 @@ app.get("/sessions/:merchantId/status", requireSecret, async (req, res) => {
  * POST /sessions/:merchantId/send
  * Send a text message from this merchant's connected session.
  * Body: { phone: string, text: string }
+ * Returns: { ok: true, messageId: string | null }
  */
 app.post("/sessions/:merchantId/send", requireSecret, async (req, res) => {
   const { merchantId } = req.params;
@@ -76,8 +77,8 @@ app.post("/sessions/:merchantId/send", requireSecret, async (req, res) => {
   }
 
   try {
-    await sendMessage(merchantId, phone, text);
-    res.json({ ok: true });
+    const messageId = await sendMessage(merchantId, phone, text);
+    res.json({ ok: true, messageId: messageId ?? null });
   } catch (err) {
     res.status(409).json({ error: (err as Error).message });
   }
@@ -95,6 +96,32 @@ app.delete("/sessions/:merchantId", requireSecret, async (req, res) => {
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`WhatsApp bridge listening on :${PORT}`);
 });
+
+// ─── Graceful shutdown ────────────────────────────────────────────────────────
+// Railway sends SIGTERM before killing the container on redeploy.
+// We intercept it, close all WA WebSocket connections cleanly (no QR rescan
+// needed on next start because we do NOT call logout()), then exit.
+
+async function onSigterm(): Promise<void> {
+  console.log("[shutdown] SIGTERM received — initiating graceful shutdown");
+
+  // Stop accepting new HTTP requests
+  server.close(() => {
+    console.log("[shutdown] HTTP server closed");
+  });
+
+  try {
+    await gracefulShutdown();
+  } catch (err) {
+    console.error("[shutdown] Error during graceful shutdown:", err);
+  }
+
+  process.exit(0);
+}
+
+process.on("SIGTERM", () => { onSigterm().catch(console.error); });
+// Also handle SIGINT (Ctrl-C in dev)
+process.on("SIGINT",  () => { onSigterm().catch(console.error); });
