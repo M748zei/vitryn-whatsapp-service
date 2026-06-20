@@ -7,7 +7,7 @@ const PORT          = parseInt(process.env.PORT ?? "3001");
 const BRIDGE_SECRET = process.env.BRIDGE_SECRET ?? "";
 
 if (!BRIDGE_SECRET) {
-  console.error("BRIDGE_SECRET env var is required");
+  console.error("[config] FATAL — BRIDGE_SECRET env var is required");
   process.exit(1);
 }
 
@@ -33,7 +33,6 @@ function requireSecret(
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
-// Health check (no auth required)
 app.get("/health", (_req, res) => {
   res.json({ ok: true, ts: Date.now() });
 });
@@ -42,6 +41,8 @@ app.get("/health", (_req, res) => {
  * GET /sessions/:merchantId/status
  * Returns current session status + QR (if pending) + connected phone.
  * Auto-initialises a disconnected session if ?init=1 is passed.
+ *
+ * Uses polling with up to 3s wait for QR generation (instead of a fixed 800ms).
  */
 app.get("/sessions/:merchantId/status", requireSecret, async (req, res) => {
   const { merchantId } = req.params;
@@ -50,11 +51,17 @@ app.get("/sessions/:merchantId/status", requireSecret, async (req, res) => {
   const current = getStatus(merchantId);
 
   if (current.status === "disconnected" && shouldInit) {
-    // Kick off session init (non-blocking)
     initSession(merchantId).catch(console.error);
 
-    // Wait briefly for QR to be generated
-    await new Promise<void>((r) => setTimeout(r, 800));
+    // Poll for QR up to 3s (300ms intervals × 10 tries)
+    for (let i = 0; i < 10; i++) {
+      await new Promise<void>((r) => setTimeout(r, 300));
+      const s = getStatus(merchantId);
+      if (s.qr || s.status === "connected") {
+        return res.json(s);
+      }
+    }
+
     return res.json(getStatus(merchantId));
   }
 
@@ -63,7 +70,6 @@ app.get("/sessions/:merchantId/status", requireSecret, async (req, res) => {
 
 /**
  * POST /sessions/:merchantId/send
- * Send a text message from this merchant's connected session.
  * Body: { phone: string, text: string }
  * Returns: { ok: true, messageId: string | null }
  */
@@ -80,7 +86,9 @@ app.post("/sessions/:merchantId/send", requireSecret, async (req, res) => {
     const messageId = await sendMessage(merchantId, phone, text);
     res.json({ ok: true, messageId: messageId ?? null });
   } catch (err) {
-    res.status(409).json({ error: (err as Error).message });
+    const errMsg = (err as Error).message;
+    console.error(`[send] Error for merchant=${merchantId}: ${errMsg}`);
+    res.status(409).json({ error: errMsg });
   }
 });
 
@@ -97,18 +105,19 @@ app.delete("/sessions/:merchantId", requireSecret, async (req, res) => {
 // ─── Start ────────────────────────────────────────────────────────────────────
 
 const server = app.listen(PORT, () => {
-  console.log(`WhatsApp bridge listening on :${PORT}`);
+  console.log(`[bridge] WhatsApp bridge listening on :${PORT}`);
 });
 
 // ─── Graceful shutdown ────────────────────────────────────────────────────────
-// Railway sends SIGTERM before killing the container on redeploy.
-// We intercept it, close all WA WebSocket connections cleanly (no QR rescan
-// needed on next start because we do NOT call logout()), then exit.
+
+let shuttingDown = false;
 
 async function onSigterm(): Promise<void> {
+  if (shuttingDown) return; // Prevent double shutdown
+  shuttingDown = true;
+
   console.log("[shutdown] SIGTERM received — initiating graceful shutdown");
 
-  // Stop accepting new HTTP requests
   server.close(() => {
     console.log("[shutdown] HTTP server closed");
   });
@@ -123,5 +132,4 @@ async function onSigterm(): Promise<void> {
 }
 
 process.on("SIGTERM", () => { onSigterm().catch(console.error); });
-// Also handle SIGINT (Ctrl-C in dev)
 process.on("SIGINT",  () => { onSigterm().catch(console.error); });

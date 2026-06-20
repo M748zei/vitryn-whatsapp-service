@@ -19,6 +19,21 @@ const SESSIONS_DIR    = process.env.SESSIONS_DIR    ?? "/data/sessions";
 const BRIDGE_SECRET   = process.env.BRIDGE_SECRET   ?? "";
 const WEBHOOK_URL     = process.env.VITRYN_WEBHOOK_URL ?? "";
 
+// ─── Startup validation ──────────────────────────────────────────────────────
+
+if (!WEBHOOK_URL) {
+  console.warn("[config] VITRYN_WEBHOOK_URL is not set — inbound messages and status updates will NOT be forwarded");
+}
+
+try {
+  fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+  fs.accessSync(SESSIONS_DIR, fs.constants.W_OK);
+  console.log(`[config] Sessions directory OK: ${SESSIONS_DIR}`);
+} catch (err) {
+  console.error(`[config] FATAL — Sessions directory ${SESSIONS_DIR} is not writable:`, err);
+  process.exit(1);
+}
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 type SessionStatus = "disconnected" | "qr_pending" | "connected";
@@ -26,9 +41,10 @@ type SessionStatus = "disconnected" | "qr_pending" | "connected";
 interface SessionState {
   socket:         WASocket | null;
   status:         SessionStatus;
-  qr:             string | null; // base64 PNG data URL for display
-  phone:          string | null; // connected phone number (digits only)
+  qr:             string | null;
+  phone:          string | null;
   retries:        number;
+  lastActivity:   number; // Date.now() of last connect/message
   repairSession?: (jid: string) => Promise<void>;
 }
 
@@ -39,11 +55,12 @@ const sessions = new Map<string, SessionState>();
 function getOrCreate(merchantId: string): SessionState {
   if (!sessions.has(merchantId)) {
     sessions.set(merchantId, {
-      socket:  null,
-      status:  "disconnected",
-      qr:      null,
-      phone:   null,
-      retries: 0,
+      socket:       null,
+      status:       "disconnected",
+      qr:           null,
+      phone:        null,
+      retries:      0,
+      lastActivity: Date.now(),
     });
   }
   return sessions.get(merchantId)!;
@@ -63,18 +80,17 @@ async function notify(
       { secret: BRIDGE_SECRET, merchantId, event, ...extra },
       { timeout: 8000 },
     );
-  } catch {
-    // Non-blocking — Vitryn may be temporarily unavailable
+  } catch (err) {
+    // Log webhook failures so they're visible in Railway logs
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[webhook] Failed to notify event=${event} merchant=${merchantId}: ${msg}`);
   }
 }
 
 // ─── Bad MAC auto-repair ──────────────────────────────────────────────────────
-// Tracks Signal decryption failures per (merchantId, jid).
-// After BAD_MAC_THRESHOLD failures, clears the corrupted Signal session keys
-// so Baileys renegotiates them on the next message — NO QR rescan needed.
 
-const macFailures   = new Map<string, number>(); // key: "merchantId:jid"
-const macRepairedAt = new Map<string, number>(); // value: unix timestamp ms
+const macFailures   = new Map<string, number>();
+const macRepairedAt = new Map<string, number>();
 
 const BAD_MAC_THRESHOLD   = 3;
 const BAD_MAC_COOLDOWN_MS = 60_000;
@@ -86,7 +102,7 @@ async function handleBadMac(merchantId: string, jid: string): Promise<void> {
 
   const now        = Date.now();
   const repairedAt = macRepairedAt.get(key) ?? 0;
-  if (now - repairedAt < BAD_MAC_COOLDOWN_MS) return; // still in cooldown
+  if (now - repairedAt < BAD_MAC_COOLDOWN_MS) return;
 
   console.warn(`[bad-mac] ${key} — failure #${count}`);
 
@@ -107,13 +123,10 @@ async function handleBadMac(merchantId: string, jid: string): Promise<void> {
 }
 
 // ─── Baileys logger with Bad MAC interception ─────────────────────────────────
-// Logs Baileys errors to stdout AND watches for Bad MAC patterns so we can
-// trigger auto-repair without requiring a new QR scan.
 
 function makeBaileysLogger(merchantId: string): ReturnType<typeof pino> {
   const dest = new Writable({
     write(chunk: Buffer, _encoding: string, done: () => void) {
-      // Write to stdout so Railway captures it
       process.stdout.write(chunk);
 
       const line = chunk.toString().trimEnd();
@@ -123,13 +136,11 @@ function makeBaileysLogger(merchantId: string): ReturnType<typeof pino> {
         const entry = JSON.parse(line) as Record<string, unknown>;
         const msg   = String(entry.msg ?? "");
 
-        // Detect Bad MAC / decrypt failure patterns in Baileys log output
         if (
           msg.toLowerCase().includes("bad mac") ||
           msg.toLowerCase().includes("failed to decrypt") ||
           msg.toLowerCase().includes("error in signal decrypt")
         ) {
-          // Baileys may log remoteJid at top level or nested under msgKey
           const jid =
             (entry.remoteJid as string | undefined) ??
             (entry.jid       as string | undefined) ??
@@ -141,7 +152,7 @@ function makeBaileysLogger(merchantId: string): ReturnType<typeof pino> {
           }
         }
       } catch {
-        // Non-JSON line — ignore
+        // Non-JSON line
       }
 
       done();
@@ -153,8 +164,14 @@ function makeBaileysLogger(merchantId: string): ReturnType<typeof pino> {
 
 // ─── Session initialisation ───────────────────────────────────────────────────
 
-const MAX_RETRIES  = 5;
-const RETRY_DELAYS = [5_000, 10_000, 20_000, 40_000, 60_000];
+const MAX_RETRIES  = 8;
+const RETRY_DELAYS = [3_000, 5_000, 10_000, 20_000, 40_000, 60_000, 90_000, 120_000];
+
+/** Add jitter ±30% to a delay to prevent thundering herd */
+function jitter(delay: number): number {
+  const factor = 0.7 + Math.random() * 0.6; // 0.7 – 1.3
+  return Math.round(delay * factor);
+}
 
 export async function initSession(merchantId: string): Promise<void> {
   const state = getOrCreate(merchantId);
@@ -162,7 +179,12 @@ export async function initSession(merchantId: string): Promise<void> {
   if (state.status === "connected" || state.status === "qr_pending") return;
 
   const dir = path.join(SESSIONS_DIR, merchantId);
-  fs.mkdirSync(dir, { recursive: true });
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch (err) {
+    console.error(`[session] Failed to create session dir for ${merchantId}:`, err);
+    return;
+  }
 
   state.status = "qr_pending";
   state.qr     = null;
@@ -171,11 +193,7 @@ export async function initSession(merchantId: string): Promise<void> {
   const { state: authState, saveCreds } = await useMultiFileAuthState(dir);
   const { version } = await fetchLatestBaileysVersion();
 
-  // Register Signal session repair closure so handleBadMac() can call it
   state.repairSession = async (jid: string) => {
-    // Setting a key to null removes the Signal session file for that JID,
-    // forcing Baileys to perform a fresh key exchange on the next message.
-    // This does NOT require a new QR scan — only affects E2E keys with this contact.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await (authState.keys as any).set({ session: { [jid]: null } });
     await saveCreds();
@@ -183,17 +201,18 @@ export async function initSession(merchantId: string): Promise<void> {
 
   const sock = makeWASocket({
     version,
-    auth:               authState,
-    browser:            Browsers.ubuntu("Chrome"),
-    printQRInTerminal:  false,
-    logger:             makeBaileysLogger(merchantId),
-    // Human-like: don't mark messages as read automatically
+    auth:                authState,
+    // Use macOS Safari — much less likely to be flagged than ubuntu/Chrome
+    browser:             Browsers.macOS("Safari"),
+    printQRInTerminal:   false,
+    logger:              makeBaileysLogger(merchantId),
     markOnlineOnConnect: false,
+    // Sync a minimal message history to reduce bandwidth & session complexity
+    syncFullHistory:     false,
   });
 
   state.socket = sock;
 
-  // Persist credentials on every update
   sock.ev.on("creds.update", saveCreds);
 
   // ── Connection state changes ──────────────────────────────────────────────
@@ -201,25 +220,26 @@ export async function initSession(merchantId: string): Promise<void> {
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr: qrStr } = update;
 
-    // New QR code available
     if (qrStr) {
       try {
         state.qr     = await qrcode.toDataURL(qrStr);
         state.status = "qr_pending";
+        console.log(`[session] QR generated for merchantId=${merchantId}`);
       } catch {
         state.qr = null;
       }
     }
 
     if (connection === "open") {
-      state.status  = "connected";
-      state.qr      = null;
-      state.retries = 0;
+      state.status       = "connected";
+      state.qr           = null;
+      state.retries      = 0;
+      state.lastActivity = Date.now();
 
-      // Parse connected phone from JID e.g. "221XXXXXXXX:42@s.whatsapp.net"
       const jidPhone = sock.user?.id?.split(":")[0] ?? null;
       state.phone = jidPhone;
 
+      console.log(`[session] Connected: merchantId=${merchantId} phone=${jidPhone}`);
       await notify(merchantId, "connected", { phone: jidPhone ?? "" });
     }
 
@@ -228,11 +248,12 @@ export async function initSession(merchantId: string): Promise<void> {
         ?.output?.statusCode;
       const loggedOut = statusCode === DisconnectReason.loggedOut;
 
+      console.log(`[session] Disconnected: merchantId=${merchantId} statusCode=${statusCode} loggedOut=${loggedOut}`);
+
       state.socket = null;
       state.qr     = null;
 
       if (loggedOut) {
-        // Clear session files — user logged out on phone
         state.status        = "disconnected";
         state.phone         = null;
         state.repairSession = undefined;
@@ -240,16 +261,17 @@ export async function initSession(merchantId: string): Promise<void> {
         await notify(merchantId, "disconnected", {});
         sessions.delete(merchantId);
       } else if (state.retries < MAX_RETRIES) {
-        // Transient disconnect — reconnect with backoff
-        const delay = RETRY_DELAYS[Math.min(state.retries, RETRY_DELAYS.length - 1)];
+        const baseDelay = RETRY_DELAYS[Math.min(state.retries, RETRY_DELAYS.length - 1)];
+        const delay = jitter(baseDelay);
         state.retries++;
         state.status = "disconnected";
+        console.log(`[session] Reconnecting merchantId=${merchantId} in ${delay}ms (retry ${state.retries}/${MAX_RETRIES})`);
         setTimeout(() => initSession(merchantId).catch(console.error), delay);
       } else {
-        // Too many retries — give up
         state.status        = "disconnected";
         state.phone         = null;
         state.repairSession = undefined;
+        console.error(`[session] Max retries exhausted for merchantId=${merchantId}`);
         await notify(merchantId, "disconnected", {});
       }
     }
@@ -261,11 +283,9 @@ export async function initSession(merchantId: string): Promise<void> {
     if (type !== "notify") return;
 
     for (const msg of messages) {
-      // Skip outbound and status messages
       if (!msg.message || msg.key.fromMe) continue;
 
       const remoteJid = msg.key.remoteJid ?? "";
-      // Only handle direct user chats (not groups or broadcast)
       if (!remoteJid.endsWith("@s.whatsapp.net")) continue;
 
       const phone = remoteJid.replace("@s.whatsapp.net", "");
@@ -276,6 +296,8 @@ export async function initSession(merchantId: string): Promise<void> {
 
       if (!body || !phone) continue;
 
+      state.lastActivity = Date.now();
+      console.log(`[message] Inbound from=${phone} merchant=${merchantId} len=${body.length}`);
       await notify(merchantId, "message", {
         from:      phone,
         body,
@@ -285,13 +307,11 @@ export async function initSession(merchantId: string): Promise<void> {
   });
 
   // ── Delivery ACK tracking ─────────────────────────────────────────────────
-  // status 2 = DELIVERY_ACK (message reached recipient's device)
-  // status 3 = READ          (recipient opened the message)
 
   sock.ev.on("messages.update", (updates) => {
     for (const { key, update } of updates) {
-      if (!key.fromMe) continue; // Only track our outbound messages
-      const jid    = key.remoteJid ?? "";
+      if (!key.fromMe) continue;
+      const jid = key.remoteJid ?? "";
       if (!jid.endsWith("@s.whatsapp.net")) continue;
 
       const status = update.status;
@@ -301,6 +321,7 @@ export async function initSession(merchantId: string): Promise<void> {
       if (!baileysMessageId) continue;
 
       const statusStr = status === 2 ? "delivered" : "read";
+      console.log(`[ack] ${statusStr}: messageId=${baileysMessageId} merchant=${merchantId}`);
       notify(merchantId, "status_update", { baileysMessageId, status: statusStr }).catch(() => {});
     }
   });
@@ -319,6 +340,12 @@ export function getStatus(
   };
 }
 
+/** Validate phone number format before building JID */
+function isValidPhone(phone: string): boolean {
+  const digits = phone.replace(/\D/g, "");
+  return digits.length >= 8 && digits.length <= 15;
+}
+
 /**
  * Send a text message with a human-like delay (2–7 s).
  * Returns the Baileys message ID (for delivery tracking), or null on failure.
@@ -334,12 +361,19 @@ export async function sendMessage(
     throw new Error("Session not connected");
   }
 
+  const cleanPhone = phone.replace(/\D/g, "");
+  if (!isValidPhone(cleanPhone)) {
+    throw new Error(`Invalid phone number: ${phone}`);
+  }
+
   // Random delay to avoid bot-detection heuristics
   const delay = 2_000 + Math.random() * 5_000;
   await new Promise<void>((r) => setTimeout(r, delay));
 
-  const jid    = phone.replace(/\D/g, "") + "@s.whatsapp.net";
+  const jid = cleanPhone + "@s.whatsapp.net";
+  console.log(`[message] Outbound to=${cleanPhone} merchant=${merchantId} len=${text.length}`);
   const result = await state.socket.sendMessage(jid, { text });
+  state.lastActivity = Date.now();
   return result?.key?.id ?? null;
 }
 
@@ -354,15 +388,18 @@ export async function disconnectSession(merchantId: string): Promise<void> {
     await state.socket?.logout();
   } catch { /* ignore */ }
 
+  // Always clean up session files, even if logout failed
+  const dir = path.join(SESSIONS_DIR, merchantId);
+  clearSessionDir(dir);
+
   state.socket        = null;
   state.status        = "disconnected";
   state.qr            = null;
   state.phone         = null;
   state.repairSession = undefined;
-
-  const dir = path.join(SESSIONS_DIR, merchantId);
-  clearSessionDir(dir);
   sessions.delete(merchantId);
+
+  console.log(`[session] Disconnected and cleaned: merchantId=${merchantId}`);
 }
 
 /**
@@ -371,30 +408,45 @@ export async function disconnectSession(merchantId: string): Promise<void> {
  * Does NOT log out — sessions are preserved on disk for the next start.
  */
 export async function gracefulShutdown(): Promise<void> {
-  console.log("[shutdown] Closing all WhatsApp sessions gracefully…");
+  console.log(`[shutdown] Closing ${sessions.size} session(s) gracefully…`);
+
+  const SHUTDOWN_TIMEOUT_MS = 5_000;
+  const closePromises: Promise<void>[] = [];
 
   for (const [merchantId, state] of sessions) {
     if (!state.socket) continue;
-    console.log(`[shutdown] Closing session for merchantId=${merchantId}`);
-    try {
-      // Remove all listeners first so the reconnect handler doesn't fire
-      state.socket.ev.removeAllListeners();
-      // Close the underlying WebSocket cleanly (code 1000 = Normal Closure)
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (state.socket as any).ws?.close(1000, "Server shutdown");
-    } catch {
-      /* ignore */
-    }
-    state.socket = null;
-    state.status = "disconnected";
+
+    const closeOne = new Promise<void>((resolve) => {
+      console.log(`[shutdown] Closing session for merchantId=${merchantId}`);
+      try {
+        state.socket!.ev.removeAllListeners();
+
+        // Close the underlying WebSocket cleanly
+        const ws = (state.socket as Record<string, unknown>).ws;
+        if (ws && typeof (ws as { close?: Function }).close === "function") {
+          (ws as { close: Function }).close(1000, "Server shutdown");
+        }
+      } catch (err) {
+        console.error(`[shutdown] Error closing ${merchantId}:`, err);
+      }
+      state.socket = null;
+      state.status = "disconnected";
+      resolve();
+    });
+
+    closePromises.push(closeOne);
   }
+
+  // Race: either all sessions close or we timeout
+  await Promise.race([
+    Promise.allSettled(closePromises),
+    new Promise<void>((r) => setTimeout(r, SHUTDOWN_TIMEOUT_MS)),
+  ]);
 
   sessions.clear();
   macFailures.clear();
   macRepairedAt.clear();
 
-  // Allow 2 s for the WS close frame to flush
-  await new Promise<void>((r) => setTimeout(r, 2_000));
   console.log("[shutdown] Done.");
 }
 
