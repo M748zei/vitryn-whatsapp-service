@@ -1,5 +1,6 @@
 import express from "express";
 import { initSession, getStatus, sendMessage, disconnectSession, gracefulShutdown } from "./sessions";
+import { enqueueMessage } from "./send-queue";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -83,7 +84,7 @@ app.post("/sessions/:merchantId/send", requireSecret, async (req, res) => {
   }
 
   try {
-    const messageId = await sendMessage(merchantId, phone, text);
+    const messageId = await enqueueMessage(merchantId, phone, text, sendMessage);
     res.json({ ok: true, messageId: messageId ?? null });
   } catch (err) {
     const errMsg = (err as Error).message;
