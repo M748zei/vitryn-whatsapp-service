@@ -247,18 +247,24 @@ export async function initSession(merchantId: string): Promise<void> {
       const statusCode = (lastDisconnect?.error as Boom | undefined)
         ?.output?.statusCode;
       const loggedOut = statusCode === DisconnectReason.loggedOut;
+      const isBan    = statusCode === 403;
+      const isDead   = isBan || loggedOut;
 
-      console.log(`[session] Disconnected: merchantId=${merchantId} statusCode=${statusCode} loggedOut=${loggedOut}`);
+      console.log(`[session] Disconnected: merchantId=${merchantId} statusCode=${statusCode} loggedOut=${loggedOut} isBan=${isBan}`);
 
       state.socket = null;
       state.qr     = null;
 
-      if (loggedOut) {
+      if (isDead) {
         state.status        = "disconnected";
         state.phone         = null;
         state.repairSession = undefined;
         clearSessionDir(dir);
-        await notify(merchantId, "disconnected", {});
+        if (isBan) {
+          await notify(merchantId, "banned", { statusCode: statusCode ?? 0 });
+        } else {
+          await notify(merchantId, "disconnected", { statusCode: statusCode ?? 0 });
+        }
         sessions.delete(merchantId);
       } else if (state.retries < MAX_RETRIES) {
         const baseDelay = RETRY_DELAYS[Math.min(state.retries, RETRY_DELAYS.length - 1)];
@@ -419,7 +425,10 @@ export async function gracefulShutdown(): Promise<void> {
     const closeOne = new Promise<void>((resolve) => {
       console.log(`[shutdown] Closing session for merchantId=${merchantId}`);
       try {
-        state.socket!.ev.removeAllListeners();
+        state.socket!.ev.removeAllListeners("creds.update");
+        state.socket!.ev.removeAllListeners("connection.update");
+        state.socket!.ev.removeAllListeners("messages.upsert");
+        state.socket!.ev.removeAllListeners("messages.update");
 
         // Close the underlying WebSocket cleanly
         const ws = (state.socket as Record<string, unknown>).ws;
